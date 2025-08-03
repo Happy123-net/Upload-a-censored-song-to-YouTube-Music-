@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Censored Music Uploader</title>
+  <style>
+    body { font-family: sans-serif; background: #1e1e1e; color: white; padding: 2em; }
+    input, button, textarea { display: block; margin: 10px 0; padding: 10px; width: 100%; }
+    #uploadForm, #logoutBtn { display: none; }
+    .error { color: red; }
+  </style>
+</head>
+<body>
+  <h2>🎵 Censored Music to YouTube Uploader</h2>
+
+  <div id="login">
+    <button onclick="startAuth()">Sign in with Google</button>
+    <p>Don’t have a Google account? <a href="https://accounts.google.com/signup" target="_blank" style="color:#0af;">Create one</a></p>
+  </div>
+
+  <div id="uploadForm">
+    <h3>Upload Clean Song</h3>
+    <input type="text" id="title" placeholder="Song Title" required />
+    <textarea id="description" placeholder="Description (no profanity)"></textarea>
+    <input type="file" id="audio" accept="audio/*" required />
+    <input type="file" id="cover" accept="image/*" />
+    <button onclick="uploadVideo()">Upload to YouTube</button>
+    <button id="logoutBtn" onclick="logout()">Logout</button>
+    <p class="error" id="error"></p>
+    <p id="status"></p>
+
+    <h4>📁 Saved Drafts</h4>
+    <ul id="draftsList"></ul>
+  </div>
+
+  <script>
+    const clientId = "1062585238262-am055rt24e7qbqjbtf5h3vi9injdqbks.apps.googleusercontent.com"; // Replace with real ID
+    const redirectUri = location.origin + location.pathname;
+    let accessToken = null;
+    let codeVerifier = null;
+
+    // IndexedDB Setup
+    let db;
+    const dbName = "CensoredMusicDB";
+
+    function initDB() {
+      const req = indexedDB.open(dbName, 1);
+      req.onupgradeneeded = function (e) {
+        db = e.target.result;
+        if (!db.objectStoreNames.contains("uploads")) {
+          db.createObjectStore("uploads", { keyPath: "id", autoIncrement: true });
+        }
+      };
+      req.onsuccess = function (e) {
+        db = e.target.result;
+        loadDrafts();
+      };
+      req.onerror = () => console.error("Failed to open DB");
+    }
+
+    function saveToDB(title, description, audioFile, coverFile) {
+      const tx = db.transaction("uploads", "readwrite");
+      const store = tx.objectStore("uploads");
+      store.add({ title, description, audioFile, coverFile });
+    }
+
+    function loadDrafts() {
+      const tx = db.transaction("uploads", "readonly");
+      const store = tx.objectStore("uploads");
+      const req = store.getAll();
+      req.onsuccess = () => {
+        const list = document.getElementById("draftsList");
+        list.innerHTML = "";
+        req.result.forEach((item, index) => {
+          const li = document.createElement("li");
+          li.textContent = item.title + " – click to restore";
+          li.style.cursor = "pointer";
+          li.onclick = () => restoreDraft(item);
+          list.appendChild(li);
+        });
+      };
+    }
+
+    function restoreDraft(draft) {
+      document.getElementById("title").value = draft.title;
+      document.getElementById("description").value = draft.description;
+    }
+
+    function generateCodeVerifier() {
+      const array = new Uint32Array(56);
+      crypto.getRandomValues(array);
+      return btoa(Array.from(array).map(x => x % 36).map(n => n.toString(36)).join('')).replace(/=/g, '');
+    }
+
+    async function generateCodeChallenge(verifier) {
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+      return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    async function startAuth() {
+      codeVerifier = generateCodeVerifier();
+      const codeChallenge = await generateCodeChallenge(codeVerifier);
+      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube&code_challenge=${codeChallenge}&code_challenge_method=S256&access_type=online`;
+      window.location.href = authUrl;
+    }
+
+    async function handleRedirect() {
+      const params = new URLSearchParams(location.search);
+      const code = params.get("code");
+      if (!code) return;
+
+      const body = new URLSearchParams({
+        client_id: clientId,
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        code_verifier: codeVerifier
+      });
+
+      const res = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body
+      });
+
+      const data = await res.json();
+      accessToken = data.access_token;
+      document.getElementById("login").style.display = "none";
+      document.getElementById("uploadForm").style.display = "block";
+      history.replaceState(null, "", redirectUri);
+    }
+
+    function logout() {
+      accessToken = null;
+      location.href = redirectUri;
+    }
+
+    function containsProfanity(text) {
+      const badWords = ["fuck", "shit", "bitch", "asshole", "nigga", "nigger"];
+      const regex = new RegExp(`\\b(${badWords.join('|')})\\b`, 'i');
+      return regex.test(text);
+    }
+
+    async function uploadVideo() {
+      const title = document.getElementById("title").value.trim();
+      const description = document.getElementById("description").value.trim();
+      const audio = document.getElementById("audio").files[0];
+      const cover = document.getElementById("cover").files[0];
+      const errorEl = document.getElementById("error");
+      const statusEl = document.getElementById("status");
+
+      errorEl.textContent = '';
+      statusEl.textContent = '';
+
+      if (!title || !audio) {
+        errorEl.textContent = "Title and audio are required.";
+        return;
+      }
+
+      if (containsProfanity(title + " " + description)) {
+        errorEl.textContent = "Profanity detected.";
+        return;
+      }
+
+      saveToDB(title, description, audio, cover);
+
+      const videoBlob = await simulateVideoCreation(audio, cover, title);
+
+      const metadata = {
+        snippet: { title, description, tags: ["clean", "music"], categoryId: "10" },
+        status: { privacyStatus: "public" }
+      };
+
+      const form = new FormData();
+      form.append("snippet", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+      form.append("video", videoBlob);
+
+      statusEl.textContent = "Uploading...";
+
+      const res = await fetch("https://www.googleapis.com/upload/youtube/v3/videos?part=snippet,status", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}` },
+        body: form
+      });
+
+      const result = await res.json();
+      if (result.id) {
+        statusEl.textContent = "✅ Uploaded! Adding to playlist...";
+        await addToCleanPlaylist(result.id);
+        statusEl.textContent += "\n✅ Added to 'Clean Music (No Cursing)'";
+      } else {
+        errorEl.textContent = "Upload failed.";
+      }
+    }
+
+    async function addToCleanPlaylist(videoId) {
+      let playlistId = await findPlaylistId("Clean Music (No Cursing)");
+      if (!playlistId) {
+        const res = await fetch("https://www.googleapis.com/youtube/v3/playlists?part=snippet", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            snippet: {
+              title: "Clean Music (No Cursing)",
+              description: "Playlist of clean songs with no cursing.",
+            },
+            status: { privacyStatus: "public" }
+          })
+        });
+        const data = await res.json();
+        playlistId = data.id;
+      }
+
+      await fetch("https://www.googleapis.com/youtube/v3/playlistItems?part=snippet", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          snippet: {
+            playlistId,
+            resourceId: { kind: "youtube#video", videoId }
+          }
+        })
+      });
+    }
+
+    async function findPlaylistId(title) {
+      const res = await fetch("https://www.googleapis.com/youtube/v3/playlists?part=snippet&mine=true&maxResults=50", {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+      const data = await res.json();
+      const match = data.items.find(p => p.snippet.title === title);
+      return match ? match.id : null;
+    }
+
+    async function simulateVideoCreation(audioFile, coverFile, title) {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1280;
+      canvas.height = 720;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#000";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 40px sans-serif";
+      ctx.fillText(title, 50, 100);
+
+      if (coverFile) {
+        const img = new Image();
+        img.src = URL.createObjectURL(coverFile);
+        await img.decode();
+        ctx.drawImage(img, 400, 200, 480, 360);
+      }
+
+      const stream = canvas.captureStream(1);
+      const recorder = new MediaRecorder(stream);
+      const chunks = [];
+      recorder.ondataavailable = e => chunks.push(e.data);
+      recorder.start();
+
+      await new Promise(resolve => setTimeout(resolve, 3000)); // Simulated 3s
+      recorder.stop();
+
+      return new Promise(resolve => {
+        recorder.onstop = () => {
+          resolve(new Blob(chunks, { type: "video/webm" }));
+        };
+      });
+    }
+
+    initDB();
+    handleRedirect();
+  </script>
+</body>
+</html>
