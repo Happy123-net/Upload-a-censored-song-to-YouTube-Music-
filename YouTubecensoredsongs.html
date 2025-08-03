@@ -24,6 +24,8 @@
     <textarea id="description" placeholder="Description (no profanity)"></textarea>
     <input type="file" id="audio" accept="audio/*" required />
     <input type="file" id="cover" accept="image/*" />
+    <p id="draftFileStatus" style="color: #0af;"></p>
+    <button onclick="saveDraft()">Save Draft</button>
     <button onclick="uploadVideo()">Upload to YouTube</button>
     <button id="logoutBtn" onclick="logout()">Logout</button>
     <p class="error" id="error"></p>
@@ -58,10 +60,58 @@
       req.onerror = () => console.error("Failed to open DB");
     }
 
-    function saveToDB(title, description, audioFile, coverFile) {
-      const tx = db.transaction("uploads", "readwrite");
-      const store = tx.objectStore("uploads");
-      store.add({ title, description, audioFile, coverFile });
+    let restoredDraftFiles = null;
+    let currentDraftId = null;
+
+    function saveToDB(draftData) {
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("uploads", "readwrite");
+        const store = tx.objectStore("uploads");
+        // Use put to allow overwriting/updating drafts. If id is not present, it's an add.
+        const req = store.put(draftData);
+        req.onsuccess = () => {
+          console.log("Draft saved with ID:", req.result);
+          loadDrafts(); // Refresh list
+          resolve(req.result); // Resolve with the key of the saved object
+        };
+        req.onerror = () => {
+          console.error("Failed to save draft:", req.error);
+          document.getElementById("error").textContent = "Failed to save draft.";
+          reject(req.error);
+        };
+      });
+    }
+
+    async function saveDraft() {
+      const title = document.getElementById("title").value.trim();
+      const description = document.getElementById("description").value.trim();
+      let audio = document.getElementById("audio").files[0];
+      let cover = document.getElementById("cover").files[0];
+      const statusEl = document.getElementById("status");
+
+      statusEl.textContent = "";
+
+      if (!title) {
+        document.getElementById("error").textContent = "Title is required to save a draft.";
+        return;
+      }
+
+      // Use restored files if no new files are selected
+      if (!audio && restoredDraftFiles && restoredDraftFiles.audioFile) {
+          audio = restoredDraftFiles.audioFile;
+      }
+      if (!cover && restoredDraftFiles && restoredDraftFiles.coverFile) {
+          cover = restoredDraftFiles.coverFile;
+      }
+
+      const draft = { title, description, audioFile: audio, coverFile: cover };
+      if (currentDraftId) {
+        draft.id = currentDraftId;
+      }
+
+      const savedId = await saveToDB(draft);
+      currentDraftId = savedId; // Keep track of the current draft ID
+      statusEl.textContent = "Draft saved!";
     }
 
     function loadDrafts() {
@@ -71,11 +121,39 @@
       req.onsuccess = () => {
         const list = document.getElementById("draftsList");
         list.innerHTML = "";
-        req.result.forEach((item, index) => {
+        req.result.forEach(item => {
           const li = document.createElement("li");
-          li.textContent = item.title + " – click to restore";
-          li.style.cursor = "pointer";
-          li.onclick = () => restoreDraft(item);
+
+          const container = document.createElement('div');
+          container.style.display = 'flex';
+          container.style.alignItems = 'center';
+          container.style.marginBottom = '5px';
+
+          const titleSpan = document.createElement('span');
+          titleSpan.textContent = item.title;
+          titleSpan.style.flexGrow = '1';
+
+          const restoreBtn = document.createElement('button');
+          restoreBtn.textContent = `Restore`;
+          restoreBtn.style.cursor = "pointer";
+          restoreBtn.style.width = 'auto';
+          restoreBtn.style.margin = '0 5px';
+          restoreBtn.onclick = () => restoreDraft(item);
+
+          const deleteBtn = document.createElement('button');
+          deleteBtn.textContent = 'Delete';
+          deleteBtn.style.cursor = "pointer";
+          deleteBtn.style.width = 'auto';
+          deleteBtn.style.margin = '0';
+          deleteBtn.onclick = (e) => {
+              e.stopPropagation();
+              deleteDraft(item.id);
+          };
+
+          container.appendChild(titleSpan);
+          container.appendChild(restoreBtn);
+          container.appendChild(deleteBtn);
+          li.appendChild(container);
           list.appendChild(li);
         });
       };
@@ -84,6 +162,39 @@
     function restoreDraft(draft) {
       document.getElementById("title").value = draft.title;
       document.getElementById("description").value = draft.description;
+
+      restoredDraftFiles = {
+          audioFile: draft.audioFile,
+          coverFile: draft.coverFile
+      };
+      currentDraftId = draft.id;
+
+      const statusEl = document.getElementById("draftFileStatus");
+      let fileStatusText = "Files loaded from draft: ";
+      if (draft.audioFile) fileStatusText += ` ${draft.audioFile.name}`;
+      if (draft.coverFile) fileStatusText += `, ${draft.coverFile.name}`;
+      statusEl.textContent = fileStatusText;
+
+      document.getElementById("audio").value = "";
+      document.getElementById("cover").value = "";
+      document.getElementById("status").textContent = "Draft restored.";
+    }
+
+    function deleteDraft(id) {
+      const tx = db.transaction("uploads", "readwrite");
+      const store = tx.objectStore("uploads");
+      store.delete(id);
+      tx.oncomplete = () => {
+          console.log(`Draft ${id} deleted.`);
+          if (currentDraftId === id) {
+              currentDraftId = null;
+              restoredDraftFiles = null;
+              document.getElementById('draftFileStatus').textContent = '';
+              document.getElementById("title").value = '';
+              document.getElementById("description").value = '';
+          }
+          loadDrafts(); // Refresh list
+      };
     }
 
     function generateCodeVerifier() {
@@ -99,6 +210,7 @@
 
     async function startAuth() {
       codeVerifier = generateCodeVerifier();
+      sessionStorage.setItem('codeVerifier', codeVerifier); // Store verifier
       const codeChallenge = await generateCodeChallenge(codeVerifier);
       const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube&code_challenge=${codeChallenge}&code_challenge_method=S256&access_type=online`;
       window.location.href = authUrl;
@@ -109,12 +221,19 @@
       const code = params.get("code");
       if (!code) return;
 
+      const storedVerifier = sessionStorage.getItem('codeVerifier');
+      if (!storedVerifier) {
+        console.error("Code verifier not found in session storage.");
+        document.getElementById("error").textContent = "Authentication error: Could not verify session. Please try signing in again.";
+        return;
+      }
+
       const body = new URLSearchParams({
         client_id: clientId,
         grant_type: "authorization_code",
         code,
         redirect_uri: redirectUri,
-        code_verifier: codeVerifier
+        code_verifier: storedVerifier
       });
 
       const res = await fetch("https://oauth2.googleapis.com/token", {
@@ -124,15 +243,37 @@
       });
 
       const data = await res.json();
-      accessToken = data.access_token;
-      document.getElementById("login").style.display = "none";
-      document.getElementById("uploadForm").style.display = "block";
+      if (data.access_token) {
+        accessToken = data.access_token;
+        sessionStorage.setItem('accessToken', accessToken);
+        document.getElementById("login").style.display = "none";
+        document.getElementById("uploadForm").style.display = "block";
+      } else {
+        console.error("Authentication failed:", data);
+        document.getElementById("error").textContent = "Authentication failed. Please try again.";
+      }
       history.replaceState(null, "", redirectUri);
     }
 
     function logout() {
       accessToken = null;
-      location.href = redirectUri;
+      sessionStorage.removeItem('codeVerifier');
+      sessionStorage.removeItem('accessToken');
+
+      document.getElementById("title").value = '';
+      document.getElementById("description").value = '';
+      document.getElementById("audio").value = '';
+      document.getElementById("cover").value = '';
+      restoredDraftFiles = null;
+      currentDraftId = null;
+      document.getElementById('draftFileStatus').textContent = '';
+      document.getElementById('error').textContent = '';
+      document.getElementById('status').textContent = '';
+
+      document.getElementById("login").style.display = "block";
+      document.getElementById("uploadForm").style.display = "none";
+
+      history.replaceState(null, "", redirectUri);
     }
 
     function containsProfanity(text) {
@@ -144,52 +285,92 @@
     async function uploadVideo() {
       const title = document.getElementById("title").value.trim();
       const description = document.getElementById("description").value.trim();
-      const audio = document.getElementById("audio").files[0];
-      const cover = document.getElementById("cover").files[0];
+      let audio = document.getElementById("audio").files[0];
+      let cover = document.getElementById("cover").files[0];
       const errorEl = document.getElementById("error");
       const statusEl = document.getElementById("status");
+      const uploadBtn = document.querySelector('button[onclick="uploadVideo()"]');
+      const saveBtn = document.querySelector('button[onclick="saveDraft()"]');
 
       errorEl.textContent = '';
       statusEl.textContent = '';
 
-      if (!title || !audio) {
-        errorEl.textContent = "Title and audio are required.";
-        return;
-      }
+      uploadBtn.disabled = true;
+      saveBtn.disabled = true;
 
-      if (containsProfanity(title + " " + description)) {
-        errorEl.textContent = "Profanity detected.";
-        return;
-      }
+      try {
+        // Use restored files if no new files are selected
+        if (!audio && restoredDraftFiles && restoredDraftFiles.audioFile) {
+            audio = restoredDraftFiles.audioFile;
+        }
+        if (!cover && restoredDraftFiles && restoredDraftFiles.coverFile) {
+            cover = restoredDraftFiles.coverFile;
+        }
 
-      saveToDB(title, description, audio, cover);
+        if (!title || !audio) {
+          errorEl.textContent = "Title and audio are required.";
+          return;
+        }
 
-      const videoBlob = await simulateVideoCreation(audio, cover, title);
+        if (containsProfanity(title + " " + description)) {
+          errorEl.textContent = "Profanity detected.";
+          return;
+        }
 
-      const metadata = {
-        snippet: { title, description, tags: ["clean", "music"], categoryId: "10" },
-        status: { privacyStatus: "public" }
-      };
+        statusEl.textContent = "Preparing video for upload...";
 
-      const form = new FormData();
-      form.append("snippet", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
-      form.append("video", videoBlob);
+        const videoBlob = await simulateVideoCreation(audio, cover, title);
 
-      statusEl.textContent = "Uploading...";
+        if (!videoBlob) {
+            errorEl.textContent = "Failed to create video from audio and cover.";
+            statusEl.textContent = "";
+            return;
+        }
 
-      const res = await fetch("https://www.googleapis.com/upload/youtube/v3/videos?part=snippet,status", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${accessToken}` },
-        body: form
-      });
+        const metadata = {
+          snippet: { title, description, tags: ["clean", "music"], categoryId: "10" },
+          status: { privacyStatus: "public" }
+        };
 
-      const result = await res.json();
-      if (result.id) {
-        statusEl.textContent = "✅ Uploaded! Adding to playlist...";
-        await addToCleanPlaylist(result.id);
-        statusEl.textContent += "\n✅ Added to 'Clean Music (No Cursing)'";
-      } else {
-        errorEl.textContent = "Upload failed.";
+        const form = new FormData();
+        form.append("snippet", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+        form.append("video", videoBlob, "video.webm");
+
+        statusEl.textContent = "Uploading to YouTube...";
+
+        const res = await fetch("https://www.googleapis.com/upload/youtube/v3/videos?part=snippet,status", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${accessToken}` },
+          body: form
+        });
+
+        const result = await res.json();
+        if (result.id) {
+          statusEl.textContent = "✅ Uploaded! Adding to playlist...";
+          await addToCleanPlaylist(result.id);
+          statusEl.textContent += "\n✅ Added to 'Clean Music (No Cursing)'";
+
+          if (currentDraftId) {
+              deleteDraft(currentDraftId);
+          }
+          document.getElementById("title").value = '';
+          document.getElementById("description").value = '';
+          document.getElementById("audio").value = '';
+          document.getElementById("cover").value = '';
+          restoredDraftFiles = null;
+          currentDraftId = null;
+          document.getElementById('draftFileStatus').textContent = '';
+
+        } else {
+          console.error("Upload failed:", result);
+          errorEl.textContent = `Upload failed: ${result.error?.message || 'Unknown error'}`;
+        }
+      } catch (e) {
+          console.error("Exception during upload:", e);
+          errorEl.textContent = "An error occurred during upload. Check console for details.";
+      } finally {
+          uploadBtn.disabled = false;
+          saveBtn.disabled = false;
       }
     }
 
@@ -239,41 +420,101 @@
     }
 
     async function simulateVideoCreation(audioFile, coverFile, title) {
-      const canvas = document.createElement("canvas");
-      canvas.width = 1280;
-      canvas.height = 720;
-      const ctx = canvas.getContext("2d");
-      ctx.fillStyle = "#000";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = "#fff";
-      ctx.font = "bold 40px sans-serif";
-      ctx.fillText(title, 50, 100);
+      try {
+        // 1. Setup Canvas for video
+        const canvas = document.createElement("canvas");
+        canvas.width = 1280;
+        canvas.height = 720;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      if (coverFile) {
-        const img = new Image();
-        img.src = URL.createObjectURL(coverFile);
-        await img.decode();
-        ctx.drawImage(img, 400, 200, 480, 360);
-      }
+        if (coverFile) {
+            const img = new Image();
+            const imgUrl = URL.createObjectURL(coverFile);
+            img.src = imgUrl;
+            await img.decode();
+            // Draw centered cover art
+            const aspectRatio = img.width / img.height;
+            let drawWidth = canvas.width;
+            let drawHeight = canvas.width / aspectRatio;
+            if (drawHeight > canvas.height) {
+                drawHeight = canvas.height;
+                drawWidth = canvas.height * aspectRatio;
+            }
+            const x = (canvas.width - drawWidth) / 2;
+            const y = (canvas.height - drawHeight) / 2;
+            ctx.drawImage(img, x, y, drawWidth, drawHeight);
+            URL.revokeObjectURL(imgUrl); // Clean up
+        }
 
-      const stream = canvas.captureStream(1);
-      const recorder = new MediaRecorder(stream);
-      const chunks = [];
-      recorder.ondataavailable = e => chunks.push(e.data);
-      recorder.start();
+        ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+        ctx.fillRect(0, 0, canvas.width, 120);
+        ctx.fillStyle = "#fff";
+        ctx.font = "bold 60px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(title, canvas.width / 2, 80);
 
-      await new Promise(resolve => setTimeout(resolve, 3000)); // Simulated 3s
-      recorder.stop();
+        const videoStream = canvas.captureStream(25); // 25 fps
+        const [videoTrack] = videoStream.getVideoTracks();
 
-      return new Promise(resolve => {
-        recorder.onstop = () => {
-          resolve(new Blob(chunks, { type: "video/webm" }));
+        // 2. Setup Web Audio API for audio
+        const audioCtx = new AudioContext();
+        const audioBuffer = await audioCtx.decodeAudioData(await audioFile.arrayBuffer());
+        const audioSource = audioCtx.createBufferSource();
+        audioSource.buffer = audioBuffer;
+
+        const audioDestination = audioCtx.createMediaStreamDestination();
+        audioSource.connect(audioDestination);
+
+        const [audioTrack] = audioDestination.stream.getAudioTracks();
+
+        // 3. Combine streams
+        const combinedStream = new MediaStream([videoTrack, audioTrack]);
+
+        // 4. Record the combined stream
+        const recorder = new MediaRecorder(combinedStream, { mimeType: 'video/webm' });
+        const chunks = [];
+        recorder.ondataavailable = e => chunks.push(e.data);
+
+        const recordingPromise = new Promise(resolve => {
+            recorder.onstop = () => {
+                resolve(new Blob(chunks, { type: "video/webm" }));
+            };
+        });
+
+        audioSource.start();
+        recorder.start();
+
+        // Stop recording when the audio finishes
+        audioSource.onended = () => {
+            recorder.stop();
+            audioCtx.close();
         };
-      });
+
+        return recordingPromise;
+
+      } catch (error) {
+        console.error("Video creation failed:", error);
+        document.getElementById("error").textContent = `Error creating video: ${error.message}`;
+        return null;
+      }
+    }
+
+    function checkLoginState() {
+        accessToken = sessionStorage.getItem('accessToken');
+        if (accessToken) {
+            document.getElementById("login").style.display = "none";
+            document.getElementById("uploadForm").style.display = "block";
+        }
     }
 
     initDB();
-    handleRedirect();
+    if (location.search.includes("code=")) {
+        handleRedirect();
+    } else {
+        checkLoginState();
+    }
   </script>
 </body>
 </html>
